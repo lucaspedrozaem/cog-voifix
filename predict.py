@@ -253,19 +253,24 @@ def make_retimed_audio(
 # =========================
 
 def extract_audio_from_video(video_path: str, out_wav: str, target_sr: int = 16000) -> str:
+    print(f"   Extracting audio from {video_path} to {out_wav}...")
     clip = mpe.VideoFileClip(video_path)
     tmp_wav = out_wav if out_wav.endswith(".wav") else out_wav + ".wav"
     # Write raw PCM then resample for consistent processing
     clip.audio.write_audiofile(tmp_wav, fps=48000, codec="pcm_s16le", verbose=False, logger=None)
     clip.close()
+    
+    print("   Resampling audio to target SR...")
     y, sr = librosa.load(tmp_wav, sr=None, mono=True)
     if sr != target_sr:
         y = librosa.resample(y, orig_sr=sr, target_sr=target_sr)
         sr = target_sr
     sf.write(out_wav, y.astype(np.float32), sr)
+    print("   Audio extraction complete.")
     return out_wav
 
 def mux_audio_into_video(video_in: str, wav_in: str, video_out: str) -> None:
+    print(f"   Muxing {wav_in} into {video_in} -> {video_out}...")
     v = mpe.VideoFileClip(video_in)
     a = mpe.AudioFileClip(wav_in)
     v_out = v.set_audio(a)
@@ -277,6 +282,7 @@ def mux_audio_into_video(video_in: str, wav_in: str, video_out: str) -> None:
     v.close()
     a.close()
     v_out.close()
+    print("   Muxing complete.")
 
 
 # =========================
@@ -288,6 +294,7 @@ class Predictor(BasePredictor):
         """
         Optional: preload anything heavy here. We keep it light; librosa/moviepy load on demand.
         """
+        print("✅ Predictor setup complete.")
         pass
 
     def predict(
@@ -309,36 +316,55 @@ class Predictor(BasePredictor):
         """
         Output: a single MP4 with the avatar video revoiced using the correct voice, matched to video timing.
         """
+        print("🚀 Prediction started...")
         if not openai_api_key:
             raise ValueError("openai_api_key is required")
 
         script_info = [(script_hint, 0)] if script_hint else [("", 0)]
 
         with tempfile.TemporaryDirectory() as td:
+            print(f"   Created temp directory: {td}")
             video_in = str(avatar_video)
             audio_in = str(correct_voice_audio)
 
             # 1) Extract avatar audio
+            print("✅ 1. Extracting avatar audio...")
             avatar_wav = os.path.join(td, "avatar.wav")
             extract_audio_from_video(video_in, avatar_wav, target_sr=target_sr)
+            if not os.path.exists(avatar_wav) or os.path.getsize(avatar_wav) == 0:
+                raise RuntimeError(f"Failed to extract avatar audio. File not found or empty: {avatar_wav}")
+            print(f"   -> Avatar audio saved: {avatar_wav} (Size: {os.path.getsize(avatar_wav)} bytes)")
 
             # 2) Ensure correct voice audio is in target_sr mono WAV
+            print("✅ 2. Preparing correct voice audio...")
             corr_wav = os.path.join(td, "correct.wav")
             y_corr, _ = load_audio_mono(audio_in, sr=target_sr)
             sf.write(corr_wav, y_corr, target_sr)
+            if not os.path.exists(corr_wav) or os.path.getsize(corr_wav) == 0:
+                raise RuntimeError(f"Failed to prepare correct voice audio. File not found or empty: {corr_wav}")
+            print(f"   -> Correct voice audio saved: {corr_wav} (Size: {os.path.getsize(corr_wav)} bytes)")
 
             # 3) Transcribe both with word timestamps
+            print("✅ 3. Transcribing audio...")
             avatar_tr = return_transcript(avatar_wav, script_info, openai_api_key)
             corr_tr   = return_transcript(corr_wav, script_info, openai_api_key)
 
+            print(f"   -> Avatar Text: {avatar_tr.get('text')}")
+            print(f"   -> Correct Voice Text: {corr_tr.get('text')}")
+
             video_words = parse_whisper_words(avatar_tr)
             corr_words  = parse_whisper_words(corr_tr)
+            
+            print(f"   -> Found {len(video_words)} avatar words.")
+            print(f"   -> Found {len(corr_words)} correct voice words.")
+
             if not video_words:
                 raise RuntimeError("No word-level timestamps found for avatar audio.")
             if not corr_words:
                 raise RuntimeError("No word-level timestamps found for correct-voice audio.")
 
             # 4) Map words and rebuild audio to match video timing
+            print("✅ 4. Aligning and retiming audio...")
             video_tokens = build_word_lists(video_words)
             corr_tokens  = build_word_lists(corr_words)
             idx_map = map_indices(video_tokens, corr_tokens)
@@ -355,12 +381,25 @@ class Predictor(BasePredictor):
                 pause_threshold=pause_threshold,
                 crossfade_ms=crossfade_ms,
             )
+            print(f"   -> Retiming complete. New audio array size: {y_aligned.size}")
 
             final_wav = os.path.join(td, "aligned.wav")
             sf.write(final_wav, y_aligned, sr)
 
+            # CRITICAL CHECK 1: Ensure the aligned WAV exists before muxing
+            if not os.path.exists(final_wav) or os.path.getsize(final_wav) == 0:
+                raise RuntimeError(f"Muxing failed: Aligned WAV file is missing or empty at {final_wav}. Audio array size was {y_aligned.size}.")
+            print(f"   -> Aligned audio saved: {final_wav} (Size: {os.path.getsize(final_wav)} bytes)")
+
             # 5) Mux back into the original video
+            print("✅ 5. Muxing final audio into video...")
             out_path = os.path.join(td, "avatar_revoiced.mp4")
             mux_audio_into_video(video_in, final_wav, out_path)
 
+            # CRITICAL CHECK 2: Ensure MoviePy/ffmpeg actually created the file
+            if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+                raise RuntimeError(f"Muxing failed: MoviePy did not create the output file at {out_path}. Check for ffmpeg errors.")
+            print(f"   -> Final video saved: {out_path} (Size: {os.path.getsize(out_path)} bytes)")
+
+            print("🏁 Prediction successful.")
             return [Path(out_path)]
