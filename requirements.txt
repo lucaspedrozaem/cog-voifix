@@ -1,3 +1,7 @@
-selenium
-Pillow
+numpy
 requests
+soundfile
+librosa
+moviepy
+audioread
+scipy
