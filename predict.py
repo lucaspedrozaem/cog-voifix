@@ -234,7 +234,7 @@ def make_retimed_audio(
         cursor_time += v_dur
 
     if video_last_end > cursor_time:
-        out_parts.append(add_silence(video_last_end - cursor_time, sr))
+        out_parts.append(add_silZence(video_last_end - cursor_time, sr))
 
     if not out_parts:
         return np.array([], dtype=np.float32)
@@ -311,12 +311,6 @@ class Predictor(BasePredictor):
             description="Enable per-chunk time-stretching (causes echo, but matches pauses)", 
             default=False
         ),
-        # ================================================================
-        # +++ NEW INPUT +++
-        # Expose the silence trimming threshold.
-        # Higher values (e.g., 30) are *stricter* and will trim more noise.
-        # Lower values (e.g., 50) are *gentler* and will trim less.
-        # ================================================================
         trim_db: int = Input(
             description="The 'top_db' threshold for silence trimming. Higher (e.g., 30) trims more.", 
             default=25
@@ -392,10 +386,6 @@ class Predictor(BasePredictor):
             if not corr_words:
                 raise RuntimeError("No word-level timestamps found for correct-voice audio.")
 
-            # ================================================================
-            # +++ NEW LOGGING (Your Request) +++
-            # Print the first 5 word timestamps from Whisper
-            # ================================================================
             print("   -> Avatar Word Timestamps (First 5):")
             for i, word in enumerate(video_words[:5]):
                 print(f"      {word['word']}: {word['start']:.3f}s - {word['end']:.3f}s")
@@ -403,12 +393,11 @@ class Predictor(BasePredictor):
             print("   -> Correct Voice Word Timestamps (First 5):")
             for i, word in enumerate(corr_words[:5]):
                 print(f"      {word['word']}: {word['start']:.3f}s - {word['end']:.3f}s")
-            # +++ END NEW LOGGING +++
 
 
             # ================================================================
-            # +++ MODIFIED FIX +++
-            # Calibrate the first word's start time using the new 'trim_db' input
+            # +++ THE BUG FIX +++
+            # Calibrate the first word's start time using the correct function
             # ================================================================
             print(f"   -> Calibrating avatar's first word start time (using top_db={trim_db})...")
             y_avatar, sr_avatar = load_audio_mono(avatar_wav_path, sr=target_sr)
@@ -416,11 +405,14 @@ class Predictor(BasePredictor):
             # Find the first frame where audio is louder than -[trim_db]dB below peak
             y_trimmed, index = librosa.effects.trim(y_avatar, top_db=trim_db) 
             
-            true_start_time = librosa.frames_to_time(index[0], sr=sr_avatar)
+            # FIX 1: 'index' is a slice object. We need 'index.start' (in samples)
+            # FIX 2: We must use 'samples_to_time', NOT 'frames_to_time'
+            true_start_time = librosa.samples_to_time(index.start, sr=sr_avatar) 
+            
             whisper_start_time = video_words[0]["start"]
             
-            print(f"   -> Librosa trim index[0]: {index[0]}")
-            print(f"   -> Librosa true_start_time: {true_start_time:.3f}s")
+            print(f"   -> Librosa trim index.start (samples): {index.start}")
+            print(f"   -> Librosa true_start_time (calculated from samples): {true_start_time:.3f}s")
             print(f"   -> Whisper first word start: {whisper_start_time:.3f}s")
             
             if whisper_start_time < true_start_time - 0.05: # Add 50ms buffer
@@ -429,7 +421,7 @@ class Predictor(BasePredictor):
                 video_words[0]["start"] = true_start_time
             else:
                 print(f"   -> Whisper start time ({whisper_start_time:.3f}s) seems correct. No override needed.")
-            # +++ END MODIFIED FIX +++
+            # +++ END BUG FIX +++
 
 
             # 4) Map words and rebuild audio to match video timing
