@@ -322,32 +322,48 @@ class Predictor(BasePredictor):
 
         script_info = [(script_hint, 0)] if script_hint else [("", 0)]
 
-        with tempfile.TemporaryDirectory() as td:
-            print(f"   Created temp directory: {td}")
+        # Define paths for cleanup
+        avatar_wav_path: Optional[str] = None
+        corr_wav_path: Optional[str] = None
+        final_wav_path: Optional[str] = None
+        out_path: Optional[str] = None
+        temp_dir: Optional[str] = None
+        
+        try:
+            # 1. Create a persistent temp file for the *final output*
+            # This file will NOT be deleted by our cleanup
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+                out_path = f.name
+            print(f"   Set final output path to: {out_path}")
+
+            # 2. Create a temporary directory for all *intermediate* files
+            temp_dir = tempfile.mkdtemp()
+            print(f"   Created temp directory for intermediates: {temp_dir}")
+            
             video_in = str(avatar_video)
             audio_in = str(correct_voice_audio)
 
             # 1) Extract avatar audio
             print("✅ 1. Extracting avatar audio...")
-            avatar_wav = os.path.join(td, "avatar.wav")
-            extract_audio_from_video(video_in, avatar_wav, target_sr=target_sr)
-            if not os.path.exists(avatar_wav) or os.path.getsize(avatar_wav) == 0:
-                raise RuntimeError(f"Failed to extract avatar audio. File not found or empty: {avatar_wav}")
-            print(f"   -> Avatar audio saved: {avatar_wav} (Size: {os.path.getsize(avatar_wav)} bytes)")
+            avatar_wav_path = os.path.join(temp_dir, "avatar.wav")
+            extract_audio_from_video(video_in, avatar_wav_path, target_sr=target_sr)
+            if not os.path.exists(avatar_wav_path) or os.path.getsize(avatar_wav_path) == 0:
+                raise RuntimeError(f"Failed to extract avatar audio. File not found or empty: {avatar_wav_path}")
+            print(f"   -> Avatar audio saved: {avatar_wav_path} (Size: {os.path.getsize(avatar_wav_path)} bytes)")
 
             # 2) Ensure correct voice audio is in target_sr mono WAV
             print("✅ 2. Preparing correct voice audio...")
-            corr_wav = os.path.join(td, "correct.wav")
+            corr_wav_path = os.path.join(temp_dir, "correct.wav")
             y_corr, _ = load_audio_mono(audio_in, sr=target_sr)
-            sf.write(corr_wav, y_corr, target_sr)
-            if not os.path.exists(corr_wav) or os.path.getsize(corr_wav) == 0:
-                raise RuntimeError(f"Failed to prepare correct voice audio. File not found or empty: {corr_wav}")
-            print(f"   -> Correct voice audio saved: {corr_wav} (Size: {os.path.getsize(corr_wav)} bytes)")
+            sf.write(corr_wav_path, y_corr, target_sr)
+            if not os.path.exists(corr_wav_path) or os.path.getsize(corr_wav_path) == 0:
+                raise RuntimeError(f"Failed to prepare correct voice audio. File not found or empty: {corr_wav_path}")
+            print(f"   -> Correct voice audio saved: {corr_wav_path} (Size: {os.path.getsize(corr_wav_path)} bytes)")
 
             # 3) Transcribe both with word timestamps
             print("✅ 3. Transcribing audio...")
-            avatar_tr = return_transcript(avatar_wav, script_info, openai_api_key)
-            corr_tr   = return_transcript(corr_wav, script_info, openai_api_key)
+            avatar_tr = return_transcript(avatar_wav_path, script_info, openai_api_key)
+            corr_tr   = return_transcript(corr_wav_path, script_info, openai_api_key)
 
             print(f"   -> Avatar Text: {avatar_tr.get('text')}")
             print(f"   -> Correct Voice Text: {corr_tr.get('text')}")
@@ -369,7 +385,7 @@ class Predictor(BasePredictor):
             corr_tokens  = build_word_lists(corr_words)
             idx_map = map_indices(video_tokens, corr_tokens)
 
-            y_corr, sr = load_audio_mono(corr_wav, sr=target_sr)
+            y_corr, sr = load_audio_mono(corr_wav_path, sr=target_sr)
             y_aligned = make_retimed_audio(
                 video_words=video_words,
                 corr_words=corr_words,
@@ -383,18 +399,18 @@ class Predictor(BasePredictor):
             )
             print(f"   -> Retiming complete. New audio array size: {y_aligned.size}")
 
-            final_wav = os.path.join(td, "aligned.wav")
-            sf.write(final_wav, y_aligned, sr)
+            final_wav_path = os.path.join(temp_dir, "aligned.wav")
+            sf.write(final_wav_path, y_aligned, sr)
 
             # CRITICAL CHECK 1: Ensure the aligned WAV exists before muxing
-            if not os.path.exists(final_wav) or os.path.getsize(final_wav) == 0:
-                raise RuntimeError(f"Muxing failed: Aligned WAV file is missing or empty at {final_wav}. Audio array size was {y_aligned.size}.")
-            print(f"   -> Aligned audio saved: {final_wav} (Size: {os.path.getsize(final_wav)} bytes)")
+            if not os.path.exists(final_wav_path) or os.path.getsize(final_wav_path) == 0:
+                raise RuntimeError(f"Muxing failed: Aligned WAV file is missing or empty at {final_wav_path}. Audio array size was {y_aligned.size}.")
+            print(f"   -> Aligned audio saved: {final_wav_path} (Size: {os.path.getsize(final_wav_path)} bytes)")
 
             # 5) Mux back into the original video
             print("✅ 5. Muxing final audio into video...")
-            out_path = os.path.join(td, "avatar_revoiced.mp4")
-            mux_audio_into_video(video_in, final_wav, out_path)
+            # Mux from the intermediate WAV to the *persistent* out_path
+            mux_audio_into_video(video_in, final_wav_path, out_path)
 
             # CRITICAL CHECK 2: Ensure MoviePy/ffmpeg actually created the file
             if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
@@ -402,4 +418,23 @@ class Predictor(BasePredictor):
             print(f"   -> Final video saved: {out_path} (Size: {os.path.getsize(out_path)} bytes)")
 
             print("🏁 Prediction successful.")
+            
+            # Return the path to the *persistent* output file
             return [Path(out_path)]
+
+        finally:
+            # 6. Clean-up
+            # This block *always* runs, even if the code fails.
+            # It deletes all the intermediate files.
+            # It does *not* delete out_path, which we are returning.
+            print("🧹 Cleaning up intermediate files...")
+            if temp_dir and os.path.exists(temp_dir):
+                try:
+                    # This will remove the directory and all its contents
+                    # (avatar.wav, correct.wav, aligned.wav)
+                    import shutil
+                    shutil.rmtree(temp_dir)
+                    print(f"   Removed intermediate directory: {temp_dir}")
+                except Exception as e:
+                    print(f"   Error cleaning up temp directory {temp_dir}: {e}")
+            print("🧼 Cleanup complete.")
