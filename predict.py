@@ -15,7 +15,6 @@ import numpy as np
 import requests
 import soundfile as sf
 import librosa
-# Ensure 'rubberband-cli' is in cog.yaml system_packages for this to work!
 import pyrubberband as pyrb
 import moviepy.editor as mpe
 
@@ -247,7 +246,6 @@ def mux_audio_into_video(video_in: str, wav_in: str, video_out: str) -> None:
     v = mpe.VideoFileClip(video_in)
     a = mpe.AudioFileClip(wav_in)
     
-    # Warn if audio duration is significantly different from video
     if abs(a.duration - v.duration) > 0.5:
          print(f"WARNING: Final audio duration ({a.duration:.2f}s) differs from video ({v.duration:.2f}s).")
 
@@ -277,13 +275,11 @@ class Predictor(BasePredictor):
         correct_voice_audio: Path = Input(description="Correct voice audio of the same script"),
         openai_api_key: str = Input(description="OpenAI API key for Whisper", default=""),
         script_hint: str = Input(default=""),
-        time_stretch: bool = Input(description="Enable Rubberband time-stretching", default=True),
-        # +++ NEW INPUT +++
+        time_stretch: bool = Input(default=True),
         audio_start_offset_ms: int = Input(
-            description="Offset audio start in milliseconds. Positive = delay audio; Negative = start audio earlier.", 
+            description="Manually offset audio start (positive=delay, negative=advance).", 
             default=0
         ),
-        # +++++++++++++++++
         stretch_min_ratio: float = Input(default=0.80),
         stretch_max_ratio: float = Input(default=1.25),
         pause_threshold: float = Input(default=0.35),
@@ -325,6 +321,35 @@ class Predictor(BasePredictor):
             if not video_words: raise RuntimeError("No words found in avatar video.")
             if not corr_words: raise RuntimeError("No words found in correct audio.")
 
+            # ================================================================
+            # +++ NEW DEBUGGING BLOCK +++
+            # Deep scan of the first second to find the 500ms gap
+            # ================================================================
+            print("\n🔍 --- DEBUG: Start Time Investigation ---")
+            print(f"   [Whisper] First word start: {video_words[0]['start']:.3f}s")
+
+            y_avatar, sr_avatar = load_audio_mono(avatar_wav_path, sr=target_sr)
+            
+            # Test 1: Librosa energy trim at various sensitivities
+            print("   [Librosa Trim Tests]")
+            for db in [20, 30, 40, 50, 60]:
+                 # We only care about the start index (index[0] is a slice start)
+                 _, index = librosa.effects.trim(y_avatar, top_db=db)
+                 onset_time = librosa.samples_to_time(index[0], sr=sr_avatar)
+                 print(f"      top_db={db}: detected start at {onset_time:.3f}s")
+
+            # Test 2: Specialized Onset Detector (looks for sharp attacks, not just volume)
+            print("   [Librosa Onset Detect Tests]")
+            # Test a few delta values (lower = more sensitive to small attacks)
+            for delta in [0.05, 0.1, 0.2, 0.3]:
+                onsets = librosa.onset.onset_detect(y=y_avatar, sr=sr_avatar, units='time', delta=delta)
+                first_onset = onsets[0] if len(onsets) > 0 else 0.0
+                print(f"      delta={delta}: first strong attack at {first_onset:.3f}s")
+            
+            print("--------------------------------------------\n")
+            # ================================================================
+
+
             print("✅ 3. Aligning and retiming...")
             idx_map = map_indices(build_word_lists(video_words), build_word_lists(corr_words))
 
@@ -334,33 +359,18 @@ class Predictor(BasePredictor):
                 time_stretch, (stretch_min_ratio, stretch_max_ratio),
                 pause_threshold, crossfade_ms
             )
-            print(f"   -> Raw retimed audio size: {y_aligned.size} samples")
 
-            # ================================================================
-            # +++ APPLY GLOBAL OFFSET +++
-            # ================================================================
+            # Apply manual offset
             if audio_start_offset_ms != 0:
-                print(f"   -> Applying audio offset: {audio_start_offset_ms}ms")
+                print(f"   -> Applying manual offset: {audio_start_offset_ms}ms")
                 offset_samples = int(round(audio_start_offset_ms * sr / 1000.0))
-                
                 if offset_samples > 0:
-                     # Positive: DELAY audio (add silence at start)
-                     silence = np.zeros(offset_samples, dtype=np.float32)
-                     y_aligned = np.concatenate([silence, y_aligned])
+                     y_aligned = np.concatenate([np.zeros(offset_samples, dtype=np.float32), y_aligned])
                 elif offset_samples < 0:
-                     # Negative: ADVANCE audio (trim from start)
                      trim_idx = abs(offset_samples)
-                     if trim_idx < len(y_aligned):
-                         y_aligned = y_aligned[trim_idx:]
-                     else:
-                         print("WARNING: Negative offset is larger than entire audio duration.")
-                         y_aligned = np.array([], dtype=np.float32)
-            # ================================================================
+                     y_aligned = y_aligned[trim_idx:] if trim_idx < len(y_aligned) else np.array([], dtype=np.float32)
 
-            if y_aligned.size == 0:
-                 raise RuntimeError("Processing produced EMPTY audio array.")
-            if np.max(np.abs(y_aligned)) < 1e-4:
-                 raise RuntimeError("Processing produced SILENT audio array. Check Rubberband/Inputs.")
+            if y_aligned.size == 0: raise RuntimeError("Empty audio after processing.")
 
             final_wav_path = os.path.join(temp_dir, "aligned.wav")
             sf.write(final_wav_path, y_aligned, sr)
