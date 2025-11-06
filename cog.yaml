@@ -23,7 +23,7 @@ build:
     - "requests"
     - "soundfile"
     - "librosa"
-    - "moviepy"
+    - "moviepy==1.0.3"
     - "audioread"
     - "scipy"
 
