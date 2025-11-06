@@ -163,12 +163,9 @@ def make_retimed_audio(
 
     out_parts: List[np.ndarray] = []
 
-    # ================================================================
-    # +++ LOGIC FIX +++
     # Initialize cursor at 0.0.
     # The loop's 'if v_start > cursor_time:' check will now
     # automatically create the leading silence on the *first run*.
-    # ================================================================
     cursor_time = 0.0
 
     # Helper to get correct-voice time span for a range of video indices
@@ -209,7 +206,6 @@ def make_retimed_audio(
         # Stretch or pad/trim per-chunk to match video timing
         if time_stretch:
             # This is the block that causes echo.
-            # You have it set to 'False' via Input default, so this is skipped.
             desired_rate = max(1e-6, c_dur / max(v_dur, 1e-6))
             lo_rate = 1.0 / max(stretch_bounds[1], 1e-6)
             hi_rate = 1.0 / max(stretch_bounds[0], 1e-6)
@@ -222,7 +218,7 @@ def make_retimed_audio(
             else:
                 seg_final = seg_ts[:new_len]
         else:
-            # This is the high-quality block you are using now.
+            # This is the high-quality block.
             new_len = int(round(v_dur * sr))
             if len(seg) < new_len:
                 pad = add_silence((new_len - len(seg)) / sr, sr)
@@ -313,7 +309,17 @@ class Predictor(BasePredictor):
         ),
         time_stretch: bool = Input(
             description="Enable per-chunk time-stretching (causes echo, but matches pauses)", 
-            default=False  # <-- Set to False based on your feedback
+            default=False
+        ),
+        # ================================================================
+        # +++ NEW INPUT +++
+        # Expose the silence trimming threshold.
+        # Higher values (e.g., 30) are *stricter* and will trim more noise.
+        # Lower values (e.g., 50) are *gentler* and will trim less.
+        # ================================================================
+        trim_db: int = Input(
+            description="The 'top_db' threshold for silence trimming. Higher (e.g., 30) trims more.", 
+            default=25
         ),
         stretch_min_ratio: float = Input(description="Lower bound for stretch factor (new/old)", default=0.80),
         stretch_max_ratio: float = Input(description="Upper bound for stretch factor (new/old)", default=1.25),
@@ -387,27 +393,43 @@ class Predictor(BasePredictor):
                 raise RuntimeError("No word-level timestamps found for correct-voice audio.")
 
             # ================================================================
-            # +++ NEW FIX +++
-            # Calibrate the first word's start time. Whisper is often
-            # wrong, starting at 0.0 even if there is silence.
-            # We find the *actual* start of energy in the avatar's audio
-            # and use that as the "true" start time.
+            # +++ NEW LOGGING (Your Request) +++
+            # Print the first 5 word timestamps from Whisper
             # ================================================================
-            print("   -> Calibrating avatar's first word start time...")
+            print("   -> Avatar Word Timestamps (First 5):")
+            for i, word in enumerate(video_words[:5]):
+                print(f"      {word['word']}: {word['start']:.3f}s - {word['end']:.3f}s")
+            
+            print("   -> Correct Voice Word Timestamps (First 5):")
+            for i, word in enumerate(corr_words[:5]):
+                print(f"      {word['word']}: {word['start']:.3f}s - {word['end']:.3f}s")
+            # +++ END NEW LOGGING +++
+
+
+            # ================================================================
+            # +++ MODIFIED FIX +++
+            # Calibrate the first word's start time using the new 'trim_db' input
+            # ================================================================
+            print(f"   -> Calibrating avatar's first word start time (using top_db={trim_db})...")
             y_avatar, sr_avatar = load_audio_mono(avatar_wav_path, sr=target_sr)
             
-            # Find the first frame where audio is louder than -40dB below peak
-            y_trimmed, index = librosa.effects.trim(y_avatar, top_db=40) 
+            # Find the first frame where audio is louder than -[trim_db]dB below peak
+            y_trimmed, index = librosa.effects.trim(y_avatar, top_db=trim_db) 
             
             true_start_time = librosa.frames_to_time(index[0], sr=sr_avatar)
+            whisper_start_time = video_words[0]["start"]
             
-            if video_words[0]["start"] < true_start_time - 0.05: # Add 50ms buffer
-                print(f"   -> Whisper start time ({video_words[0]['start']:.2f}s) is BEFORE audio detection ({true_start_time:.2f}s).")
-                print(f"   -> Overriding first word start time to {true_start_time:.2f}s.")
+            print(f"   -> Librosa trim index[0]: {index[0]}")
+            print(f"   -> Librosa true_start_time: {true_start_time:.3f}s")
+            print(f"   -> Whisper first word start: {whisper_start_time:.3f}s")
+            
+            if whisper_start_time < true_start_time - 0.05: # Add 50ms buffer
+                print(f"   -> Whisper start time ({whisper_start_time:.3f}s) is BEFORE audio detection ({true_start_time:.3f}s).")
+                print(f"   -> Overriding first word start time to {true_start_time:.3f}s.")
                 video_words[0]["start"] = true_start_time
             else:
-                print(f"   -> Whisper start time ({video_words[0]['start']:.2f}s) seems correct. No override needed.")
-            # +++ END NEW FIX +++
+                print(f"   -> Whisper start time ({whisper_start_time:.3f}s) seems correct. No override needed.")
+            # +++ END MODIFIED FIX +++
 
 
             # 4) Map words and rebuild audio to match video timing
