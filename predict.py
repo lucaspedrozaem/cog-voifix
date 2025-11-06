@@ -15,6 +15,7 @@ import numpy as np
 import requests
 import soundfile as sf
 import librosa
+# Ensure 'rubberband-cli' is in cog.yaml system_packages for this to work!
 import pyrubberband as pyrb
 import moviepy.editor as mpe
 
@@ -180,7 +181,6 @@ def make_retimed_audio(
             hi_rate = 1.0 / max(stretch_bounds[0], 1e-6)
             rate = float(np.clip(desired_rate, lo_rate, hi_rate))
             
-            # Using pyrubberband. Ensure 'rubberband-cli' is in cog.yaml system_packages!
             try:
                 seg_ts = pyrb.time_stretch(seg, sr, rate=rate)
             except Exception as e:
@@ -245,10 +245,11 @@ def extract_audio_from_video(video_path: str, out_wav: str, target_sr: int = 160
 def mux_audio_into_video(video_in: str, wav_in: str, video_out: str) -> None:
     print(f"   Muxing {wav_in} into {video_in} -> {video_out}...")
     v = mpe.VideoFileClip(video_in)
-    # Load audio and force expected duration to match video if slightly off
     a = mpe.AudioFileClip(wav_in)
+    
+    # Warn if audio duration is significantly different from video
     if abs(a.duration - v.duration) > 0.5:
-         print(f"WARNING: Audio duration ({a.duration}s) differs from video ({v.duration}s).")
+         print(f"WARNING: Final audio duration ({a.duration:.2f}s) differs from video ({v.duration:.2f}s).")
 
     v_out = v.set_audio(a)
     v_out.write_videofile(
@@ -277,6 +278,12 @@ class Predictor(BasePredictor):
         openai_api_key: str = Input(description="OpenAI API key for Whisper", default=""),
         script_hint: str = Input(default=""),
         time_stretch: bool = Input(description="Enable Rubberband time-stretching", default=True),
+        # +++ NEW INPUT +++
+        audio_start_offset_ms: int = Input(
+            description="Offset audio start in milliseconds. Positive = delay audio; Negative = start audio earlier.", 
+            default=0
+        ),
+        # +++++++++++++++++
         stretch_min_ratio: float = Input(default=0.80),
         stretch_max_ratio: float = Input(default=1.25),
         pause_threshold: float = Input(default=0.35),
@@ -327,14 +334,33 @@ class Predictor(BasePredictor):
                 time_stretch, (stretch_min_ratio, stretch_max_ratio),
                 pause_threshold, crossfade_ms
             )
-            print(f"   -> New audio array size: {y_aligned.size}")
+            print(f"   -> Raw retimed audio size: {y_aligned.size} samples")
 
-            # +++ CRITICAL SILENCE CHECK +++
+            # ================================================================
+            # +++ APPLY GLOBAL OFFSET +++
+            # ================================================================
+            if audio_start_offset_ms != 0:
+                print(f"   -> Applying audio offset: {audio_start_offset_ms}ms")
+                offset_samples = int(round(audio_start_offset_ms * sr / 1000.0))
+                
+                if offset_samples > 0:
+                     # Positive: DELAY audio (add silence at start)
+                     silence = np.zeros(offset_samples, dtype=np.float32)
+                     y_aligned = np.concatenate([silence, y_aligned])
+                elif offset_samples < 0:
+                     # Negative: ADVANCE audio (trim from start)
+                     trim_idx = abs(offset_samples)
+                     if trim_idx < len(y_aligned):
+                         y_aligned = y_aligned[trim_idx:]
+                     else:
+                         print("WARNING: Negative offset is larger than entire audio duration.")
+                         y_aligned = np.array([], dtype=np.float32)
+            # ================================================================
+
             if y_aligned.size == 0:
-                 raise RuntimeError("Retiming produced EMPTY audio array.")
+                 raise RuntimeError("Processing produced EMPTY audio array.")
             if np.max(np.abs(y_aligned)) < 1e-4:
-                 raise RuntimeError("Retiming produced SILENT audio array (all zeros). check Rubberband installation.")
-            # ++++++++++++++++++++++++++++++
+                 raise RuntimeError("Processing produced SILENT audio array. Check Rubberband/Inputs.")
 
             final_wav_path = os.path.join(temp_dir, "aligned.wav")
             sf.write(final_wav_path, y_aligned, sr)
