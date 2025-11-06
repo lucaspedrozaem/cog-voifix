@@ -15,6 +15,7 @@ build:
     - "libswscale-dev"
     - "libx264-dev"
     - "ca-certificates"
+    - "rubberband-cli"
 
   python_version: "3.11"
 
@@ -26,6 +27,7 @@ build:
     - "moviepy==1.0.3"
     - "audioread"
     - "scipy"
+    - "pyrubberband"
 
   run:
     - "echo '✅ Environment ready for audio/video alignment'"

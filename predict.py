@@ -9,11 +9,13 @@ import json
 import math
 import tempfile
 import difflib
+import shutil
 
 import numpy as np
 import requests
 import soundfile as sf
 import librosa
+import pyrubberband as pyrb  # <--- NEW IMPORT
 import moviepy.editor as mpe
 
 
@@ -163,9 +165,7 @@ def make_retimed_audio(
 
     out_parts: List[np.ndarray] = []
 
-    # Initialize cursor at 0.0.
-    # The loop's 'if v_start > cursor_time:' check will now
-    # automatically create the leading silence on the *first run*.
+    # Initialize cursor at 0.0 to automatically handle leading silence on first loop iteration
     cursor_time = 0.0
 
     # Helper to get correct-voice time span for a range of video indices
@@ -183,7 +183,7 @@ def make_retimed_audio(
         v_end   = video_words[v_i2 - 1]["end"]
         v_dur   = max(0.0, v_end - v_start)
 
-        # Fill any gap (this will now include the leading silence)
+        # Fill any gap (includes leading silence if v_start > 0 on first chunk)
         if v_start > cursor_time:
             out_parts.append(add_silence(v_start - cursor_time, sr))
             cursor_time = v_start
@@ -205,12 +205,15 @@ def make_retimed_audio(
 
         # Stretch or pad/trim per-chunk to match video timing
         if time_stretch:
-            # This is the block that causes echo.
             desired_rate = max(1e-6, c_dur / max(v_dur, 1e-6))
             lo_rate = 1.0 / max(stretch_bounds[1], 1e-6)
             hi_rate = 1.0 / max(stretch_bounds[0], 1e-6)
             rate = float(np.clip(desired_rate, lo_rate, hi_rate))
-            seg_ts = librosa.effects.time_stretch(seg, rate=rate)
+            
+            # +++ UPGRADE: Use pyrubberband for higher quality stretching +++
+            # pyrb.time_stretch(y, sr, rate) -> rate > 1.0 means faster (shorter)
+            seg_ts = pyrb.time_stretch(seg, sr, rate=rate)
+            
             new_len = int(round(v_dur * sr))
             if len(seg_ts) < new_len:
                 pad = add_silence((new_len - len(seg_ts)) / sr, sr)
@@ -218,7 +221,6 @@ def make_retimed_audio(
             else:
                 seg_final = seg_ts[:new_len]
         else:
-            # This is the high-quality block.
             new_len = int(round(v_dur * sr))
             if len(seg) < new_len:
                 pad = add_silence((new_len - len(seg)) / sr, sr)
@@ -234,7 +236,7 @@ def make_retimed_audio(
         cursor_time += v_dur
 
     if video_last_end > cursor_time:
-        out_parts.append(add_silZence(video_last_end - cursor_time, sr))
+        out_parts.append(add_silence(video_last_end - cursor_time, sr))
 
     if not out_parts:
         return np.array([], dtype=np.float32)
@@ -292,9 +294,6 @@ def mux_audio_into_video(video_in: str, wav_in: str, video_out: str) -> None:
 
 class Predictor(BasePredictor):
     def setup(self) -> None:
-        """
-        Optional: preload anything heavy here. We keep it light; librosa/moviepy load on demand.
-        """
         print("✅ Predictor setup complete.")
         pass
 
@@ -308,12 +307,8 @@ class Predictor(BasePredictor):
             default=""
         ),
         time_stretch: bool = Input(
-            description="Enable per-chunk time-stretching (causes echo, but matches pauses)", 
-            default=False
-        ),
-        trim_db: int = Input(
-            description="The 'top_db' threshold for silence trimming. Higher (e.g., 30) trims more.", 
-            default=25
+            description="Enable high-quality (Rubberband) time-stretching to match video timing.", 
+            default=True # Enabled by default now that quality is better
         ),
         stretch_min_ratio: float = Input(description="Lower bound for stretch factor (new/old)", default=0.80),
         stretch_max_ratio: float = Input(description="Upper bound for stretch factor (new/old)", default=1.25),
@@ -321,9 +316,6 @@ class Predictor(BasePredictor):
         crossfade_ms: int = Input(description="Crossfade between chunks (ms)", default=40),
         target_sr: int = Input(description="Internal processing sample rate", default=16000),
     ) -> List[Path]:
-        """
-        Output: a single MP4 with the avatar video revoiced using the correct voice, matched to video timing.
-        """
         print("🚀 Prediction started...")
         if not openai_api_key:
             raise ValueError("openai_api_key is required")
@@ -331,10 +323,6 @@ class Predictor(BasePredictor):
         script_info = [(script_hint, 0)] if script_hint else [("", 0)]
 
         # Define paths for cleanup
-        avatar_wav_path: Optional[str] = None
-        corr_wav_path: Optional[str] = None
-        final_wav_path: Optional[str] = None
-        out_path: Optional[str] = None
         temp_dir: Optional[str] = None
         
         try:
@@ -356,7 +344,6 @@ class Predictor(BasePredictor):
             extract_audio_from_video(video_in, avatar_wav_path, target_sr=target_sr)
             if not os.path.exists(avatar_wav_path) or os.path.getsize(avatar_wav_path) == 0:
                 raise RuntimeError(f"Failed to extract avatar audio. File not found or empty: {avatar_wav_path}")
-            print(f"   -> Avatar audio saved: {avatar_wav_path} (Size: {os.path.getsize(avatar_wav_path)} bytes)")
 
             # 2) Ensure correct voice audio is in target_sr mono WAV
             print("✅ 2. Preparing correct voice audio...")
@@ -365,15 +352,11 @@ class Predictor(BasePredictor):
             sf.write(corr_wav_path, y_corr, target_sr)
             if not os.path.exists(corr_wav_path) or os.path.getsize(corr_wav_path) == 0:
                 raise RuntimeError(f"Failed to prepare correct voice audio. File not found or empty: {corr_wav_path}")
-            print(f"   -> Correct voice audio saved: {corr_wav_path} (Size: {os.path.getsize(corr_wav_path)} bytes)")
 
             # 3) Transcribe both with word timestamps
             print("✅ 3. Transcribing audio...")
             avatar_tr = return_transcript(avatar_wav_path, script_info, openai_api_key)
             corr_tr   = return_transcript(corr_wav_path, script_info, openai_api_key)
-
-            print(f"   -> Avatar Text: {avatar_tr.get('text')}")
-            print(f"   -> Correct Voice Text: {corr_tr.get('text')}")
 
             video_words = parse_whisper_words(avatar_tr)
             corr_words  = parse_whisper_words(corr_tr)
@@ -386,46 +369,8 @@ class Predictor(BasePredictor):
             if not corr_words:
                 raise RuntimeError("No word-level timestamps found for correct-voice audio.")
 
-            print("   -> Avatar Word Timestamps (First 5):")
-            for i, word in enumerate(video_words[:5]):
-                print(f"      {word['word']}: {word['start']:.3f}s - {word['end']:.3f}s")
-            
-            print("   -> Correct Voice Word Timestamps (First 5):")
-            for i, word in enumerate(corr_words[:5]):
-                print(f"      {word['word']}: {word['start']:.3f}s - {word['end']:.3f}s")
-
-
-            # ================================================================
-            # +++ THE BUG FIX +++
-            # Calibrate the first word's start time using the correct function
-            # ================================================================
-            print(f"   -> Calibrating avatar's first word start time (using top_db={trim_db})...")
-            y_avatar, sr_avatar = load_audio_mono(avatar_wav_path, sr=target_sr)
-            
-            # Find the first frame where audio is louder than -[trim_db]dB below peak
-            y_trimmed, index = librosa.effects.trim(y_avatar, top_db=trim_db) 
-            
-            # FIX 1: 'index' is a slice object. We need 'index.start' (in samples)
-            # FIX 2: We must use 'samples_to_time', NOT 'frames_to_time'
-            true_start_time = librosa.samples_to_time(index.start, sr=sr_avatar) 
-            
-            whisper_start_time = video_words[0]["start"]
-            
-            print(f"   -> Librosa trim index.start (samples): {index.start}")
-            print(f"   -> Librosa true_start_time (calculated from samples): {true_start_time:.3f}s")
-            print(f"   -> Whisper first word start: {whisper_start_time:.3f}s")
-            
-            if whisper_start_time < true_start_time - 0.05: # Add 50ms buffer
-                print(f"   -> Whisper start time ({whisper_start_time:.3f}s) is BEFORE audio detection ({true_start_time:.3f}s).")
-                print(f"   -> Overriding first word start time to {true_start_time:.3f}s.")
-                video_words[0]["start"] = true_start_time
-            else:
-                print(f"   -> Whisper start time ({whisper_start_time:.3f}s) seems correct. No override needed.")
-            # +++ END BUG FIX +++
-
-
             # 4) Map words and rebuild audio to match video timing
-            print("✅ 4. Aligning and retiming audio...")
+            print("✅ 4. Aligning and retiming audio (Rubberband enabled)...")
             video_tokens = build_word_lists(video_words)
             corr_tokens  = build_word_lists(corr_words)
             idx_map = map_indices(video_tokens, corr_tokens)
@@ -447,35 +392,22 @@ class Predictor(BasePredictor):
             final_wav_path = os.path.join(temp_dir, "aligned.wav")
             sf.write(final_wav_path, y_aligned, sr)
 
-            # CRITICAL CHECK 1: Ensure the aligned WAV exists before muxing
             if not os.path.exists(final_wav_path) or os.path.getsize(final_wav_path) == 0:
-                raise RuntimeError(f"Muxing failed: Aligned WAV file is missing or empty at {final_wav_path}. Audio array size was {y_aligned.size}.")
-            print(f"   -> Aligned audio saved: {final_wav_path} (Size: {os.path.getsize(final_wav_path)} bytes)")
+                raise RuntimeError(f"Muxing failed: Aligned WAV file is missing or empty at {final_wav_path}.")
 
             # 5) Mux back into the original video
             print("✅ 5. Muxing final audio into video...")
-            # Mux from the intermediate WAV to the *persistent* out_path
             mux_audio_into_video(video_in, final_wav_path, out_path)
 
-            # CRITICAL CHECK 2: Ensure MoviePy/ffmpeg actually created the file
             if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-                raise RuntimeError(f"Muxing failed: MoviePy did not create the output file at {out_path}. Check for ffmpeg errors.")
+                raise RuntimeError(f"Muxing failed: Output file missing at {out_path}.")
             print(f"   -> Final video saved: {out_path} (Size: {os.path.getsize(out_path)} bytes)")
 
             print("🏁 Prediction successful.")
-            
-            # Return the path to the *persistent* output file
             return [Path(out_path)]
 
         finally:
-            # 6. Clean-up
             print("🧹 Cleaning up intermediate files...")
             if temp_dir and os.path.exists(temp_dir):
-                try:
-                    # This will remove the directory and all its contents
-                    import shutil
-                    shutil.rmtree(temp_dir)
-                    print(f"   Removed intermediate directory: {temp_dir}")
-                except Exception as e:
-                    print(f"   Error cleaning up temp directory {temp_dir}: {e}")
+                shutil.rmtree(temp_dir, ignore_errors=True)
             print("🧼 Cleanup complete.")
