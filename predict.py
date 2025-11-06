@@ -351,4 +351,117 @@ class Predictor(BasePredictor):
             audio_in = str(correct_voice_audio)
 
             # 1) Extract avatar audio
-            print("✅ 1
+            print("✅ 1. Extracting avatar audio...")
+            avatar_wav_path = os.path.join(temp_dir, "avatar.wav")
+            extract_audio_from_video(video_in, avatar_wav_path, target_sr=target_sr)
+            if not os.path.exists(avatar_wav_path) or os.path.getsize(avatar_wav_path) == 0:
+                raise RuntimeError(f"Failed to extract avatar audio. File not found or empty: {avatar_wav_path}")
+            print(f"   -> Avatar audio saved: {avatar_wav_path} (Size: {os.path.getsize(avatar_wav_path)} bytes)")
+
+            # 2) Ensure correct voice audio is in target_sr mono WAV
+            print("✅ 2. Preparing correct voice audio...")
+            corr_wav_path = os.path.join(temp_dir, "correct.wav")
+            y_corr, _ = load_audio_mono(audio_in, sr=target_sr)
+            sf.write(corr_wav_path, y_corr, target_sr)
+            if not os.path.exists(corr_wav_path) or os.path.getsize(corr_wav_path) == 0:
+                raise RuntimeError(f"Failed to prepare correct voice audio. File not found or empty: {corr_wav_path}")
+            print(f"   -> Correct voice audio saved: {corr_wav_path} (Size: {os.path.getsize(corr_wav_path)} bytes)")
+
+            # 3) Transcribe both with word timestamps
+            print("✅ 3. Transcribing audio...")
+            avatar_tr = return_transcript(avatar_wav_path, script_info, openai_api_key)
+            corr_tr   = return_transcript(corr_wav_path, script_info, openai_api_key)
+
+            print(f"   -> Avatar Text: {avatar_tr.get('text')}")
+            print(f"   -> Correct Voice Text: {corr_tr.get('text')}")
+
+            video_words = parse_whisper_words(avatar_tr)
+            corr_words  = parse_whisper_words(corr_tr)
+            
+            print(f"   -> Found {len(video_words)} avatar words.")
+            print(f"   -> Found {len(corr_words)} correct voice words.")
+
+            if not video_words:
+                raise RuntimeError("No word-level timestamps found for avatar audio.")
+            if not corr_words:
+                raise RuntimeError("No word-level timestamps found for correct-voice audio.")
+
+            # ================================================================
+            # +++ NEW FIX +++
+            # Calibrate the first word's start time. Whisper is often
+            # wrong, starting at 0.0 even if there is silence.
+            # We find the *actual* start of energy in the avatar's audio
+            # and use that as the "true" start time.
+            # ================================================================
+            print("   -> Calibrating avatar's first word start time...")
+            y_avatar, sr_avatar = load_audio_mono(avatar_wav_path, sr=target_sr)
+            
+            # Find the first frame where audio is louder than -40dB below peak
+            y_trimmed, index = librosa.effects.trim(y_avatar, top_db=40) 
+            
+            true_start_time = librosa.frames_to_time(index[0], sr=sr_avatar)
+            
+            if video_words[0]["start"] < true_start_time - 0.05: # Add 50ms buffer
+                print(f"   -> Whisper start time ({video_words[0]['start']:.2f}s) is BEFORE audio detection ({true_start_time:.2f}s).")
+                print(f"   -> Overriding first word start time to {true_start_time:.2f}s.")
+                video_words[0]["start"] = true_start_time
+            else:
+                print(f"   -> Whisper start time ({video_words[0]['start']:.2f}s) seems correct. No override needed.")
+            # +++ END NEW FIX +++
+
+
+            # 4) Map words and rebuild audio to match video timing
+            print("✅ 4. Aligning and retiming audio...")
+            video_tokens = build_word_lists(video_words)
+            corr_tokens  = build_word_lists(corr_words)
+            idx_map = map_indices(video_tokens, corr_tokens)
+
+            y_corr, sr = load_audio_mono(corr_wav_path, sr=target_sr)
+            y_aligned = make_retimed_audio(
+                video_words=video_words,
+                corr_words=corr_words,
+                time_map=idx_map,
+                corr_wave=y_corr,
+                sr=sr,
+                time_stretch=time_stretch,
+                stretch_bounds=(stretch_min_ratio, stretch_max_ratio),
+                pause_threshold=pause_threshold,
+                crossfade_ms=crossfade_ms,
+            )
+            print(f"   -> Retiming complete. New audio array size: {y_aligned.size}")
+
+            final_wav_path = os.path.join(temp_dir, "aligned.wav")
+            sf.write(final_wav_path, y_aligned, sr)
+
+            # CRITICAL CHECK 1: Ensure the aligned WAV exists before muxing
+            if not os.path.exists(final_wav_path) or os.path.getsize(final_wav_path) == 0:
+                raise RuntimeError(f"Muxing failed: Aligned WAV file is missing or empty at {final_wav_path}. Audio array size was {y_aligned.size}.")
+            print(f"   -> Aligned audio saved: {final_wav_path} (Size: {os.path.getsize(final_wav_path)} bytes)")
+
+            # 5) Mux back into the original video
+            print("✅ 5. Muxing final audio into video...")
+            # Mux from the intermediate WAV to the *persistent* out_path
+            mux_audio_into_video(video_in, final_wav_path, out_path)
+
+            # CRITICAL CHECK 2: Ensure MoviePy/ffmpeg actually created the file
+            if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+                raise RuntimeError(f"Muxing failed: MoviePy did not create the output file at {out_path}. Check for ffmpeg errors.")
+            print(f"   -> Final video saved: {out_path} (Size: {os.path.getsize(out_path)} bytes)")
+
+            print("🏁 Prediction successful.")
+            
+            # Return the path to the *persistent* output file
+            return [Path(out_path)]
+
+        finally:
+            # 6. Clean-up
+            print("🧹 Cleaning up intermediate files...")
+            if temp_dir and os.path.exists(temp_dir):
+                try:
+                    # This will remove the directory and all its contents
+                    import shutil
+                    shutil.rmtree(temp_dir)
+                    print(f"   Removed intermediate directory: {temp_dir}")
+                except Exception as e:
+                    print(f"   Error cleaning up temp directory {temp_dir}: {e}")
+            print("🧼 Cleanup complete.")
