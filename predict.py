@@ -277,7 +277,7 @@ class Predictor(BasePredictor):
         script_hint: str = Input(default=""),
         time_stretch: bool = Input(default=True),
         audio_start_offset_ms: int = Input(
-            description="Manually offset audio start (positive=delay, negative=advance).", 
+            description="Manual offset override in ms. If 0, auto-calibration is attempted.", 
             default=0
         ),
         stretch_min_ratio: float = Input(default=0.80),
@@ -299,14 +299,12 @@ class Predictor(BasePredictor):
             print(f"   Set final output path to: {out_path}")
 
             temp_dir = tempfile.mkdtemp()
-            
             video_in = str(avatar_video)
             audio_in = str(correct_voice_audio)
 
             print("✅ 1. Extracting/Preparing audio...")
             avatar_wav_path = os.path.join(temp_dir, "avatar.wav")
             extract_audio_from_video(video_in, avatar_wav_path, target_sr=target_sr)
-
             corr_wav_path = os.path.join(temp_dir, "correct.wav")
             y_corr_orig, _ = load_audio_mono(audio_in, sr=target_sr)
             sf.write(corr_wav_path, y_corr_orig, target_sr)
@@ -314,41 +312,38 @@ class Predictor(BasePredictor):
             print("✅ 2. Transcribing...")
             avatar_tr = return_transcript(avatar_wav_path, script_info, openai_api_key)
             corr_tr   = return_transcript(corr_wav_path, script_info, openai_api_key)
-
             video_words = parse_whisper_words(avatar_tr)
             corr_words  = parse_whisper_words(corr_tr)
-
-            if not video_words: raise RuntimeError("No words found in avatar video.")
-            if not corr_words: raise RuntimeError("No words found in correct audio.")
+            if not video_words or not corr_words: raise RuntimeError("Failed to find words in one of the inputs.")
 
             # ================================================================
-            # +++ NEW DEBUGGING BLOCK +++
-            # Deep scan of the first second to find the 500ms gap
+            # +++ AUTO-CALIBRATION LOGIC +++
             # ================================================================
-            print("\n🔍 --- DEBUG: Start Time Investigation ---")
-            print(f"   [Whisper] First word start: {video_words[0]['start']:.3f}s")
-
-            y_avatar, sr_avatar = load_audio_mono(avatar_wav_path, sr=target_sr)
+            whisper_start = video_words[0]['start']
             
-            # Test 1: Librosa energy trim at various sensitivities
-            print("   [Librosa Trim Tests]")
-            for db in [20, 30, 40, 50, 60]:
-                 # We only care about the start index (index[0] is a slice start)
-                 _, index = librosa.effects.trim(y_avatar, top_db=db)
-                 onset_time = librosa.samples_to_time(index[0], sr=sr_avatar)
-                 print(f"      top_db={db}: detected start at {onset_time:.3f}s")
-
-            # Test 2: Specialized Onset Detector (looks for sharp attacks, not just volume)
-            print("   [Librosa Onset Detect Tests]")
-            # Test a few delta values (lower = more sensitive to small attacks)
-            for delta in [0.05, 0.1, 0.2, 0.3]:
-                onsets = librosa.onset.onset_detect(y=y_avatar, sr=sr_avatar, units='time', delta=delta)
-                first_onset = onsets[0] if len(onsets) > 0 else 0.0
-                print(f"      delta={delta}: first strong attack at {first_onset:.3f}s")
-            
-            print("--------------------------------------------\n")
+            # Only run auto-calibration if:
+            # 1. No manual offset was provided (offset == 0)
+            # 2. Whisper thinks it starts almost instantly (< 50ms)
+            if audio_start_offset_ms == 0 and whisper_start < 0.05:
+                print("🕵️‍♂️ Auto-calibrating start time (Whisper reported ~0s)...")
+                y_avatar, sr_avatar = load_audio_mono(avatar_wav_path, sr=target_sr)
+                
+                # Use the magical delta=0.2 that worked in your logs
+                onsets = librosa.onset.onset_detect(y=y_avatar, sr=sr_avatar, units='time', delta=0.2)
+                
+                if len(onsets) > 0:
+                    first_onset = onsets[0]
+                    # If we found a start time that is significantly later than Whisper's 0.0s
+                    if first_onset > 0.1: 
+                         print(f"🎯 Auto-calibration found true start at {first_onset:.3f}s. Overriding Whisper.")
+                         # This single line fixes everything downstream. 
+                         # The retimer will now automatically insert this much silence at the start.
+                         video_words[0]['start'] = first_onset
+                    else:
+                         print(f"   Auto-calibration confirmed start near 0s ({first_onset:.3f}s).")
+                else:
+                    print("⚠️ Auto-calibration failed to detect any strong onsets. Using Whisper default.")
             # ================================================================
-
 
             print("✅ 3. Aligning and retiming...")
             idx_map = map_indices(build_word_lists(video_words), build_word_lists(corr_words))
@@ -360,9 +355,9 @@ class Predictor(BasePredictor):
                 pause_threshold, crossfade_ms
             )
 
-            # Apply manual offset
+            # Apply manual offset if provided (overrides auto-calibration because of the if check above)
             if audio_start_offset_ms != 0:
-                print(f"   -> Applying manual offset: {audio_start_offset_ms}ms")
+                print(f"👉 Applying manual offset: {audio_start_offset_ms}ms")
                 offset_samples = int(round(audio_start_offset_ms * sr / 1000.0))
                 if offset_samples > 0:
                      y_aligned = np.concatenate([np.zeros(offset_samples, dtype=np.float32), y_aligned])
@@ -370,7 +365,8 @@ class Predictor(BasePredictor):
                      trim_idx = abs(offset_samples)
                      y_aligned = y_aligned[trim_idx:] if trim_idx < len(y_aligned) else np.array([], dtype=np.float32)
 
-            if y_aligned.size == 0: raise RuntimeError("Empty audio after processing.")
+            if y_aligned.size == 0 or np.max(np.abs(y_aligned)) < 1e-4:
+                 raise RuntimeError("Processing produced empty or silent audio.")
 
             final_wav_path = os.path.join(temp_dir, "aligned.wav")
             sf.write(final_wav_path, y_aligned, sr)
